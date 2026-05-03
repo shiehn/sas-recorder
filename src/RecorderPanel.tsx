@@ -22,6 +22,9 @@ import type {
 } from '@signalsandsorcery/plugin-sdk';
 import { useRecorder } from './useRecorder';
 import { WaveformView } from './shared/WaveformView';
+import { LevelMeter } from './shared/LevelMeter';
+import { ScrollingWaveform } from './shared/ScrollingWaveform';
+import { analyzeWavPeak, type PeakAnalysis } from './shared/wavPeakAnalyzer';
 import {
   VOCAL_PRESETS,
   applyVocalPreset,
@@ -40,6 +43,8 @@ interface Take {
   filePath: string;
   /** Engine chunk index this take corresponds to. */
   chunkIndex: number;
+  /** Peak analysis (Phase 8.10) — populated async after take lands. */
+  peak?: PeakAnalysis;
 }
 
 /** Take counter — engineers expect take numbers to start at 1, not 0. */
@@ -60,6 +65,19 @@ export const RecorderPanel: React.FC<PluginUIProps> = ({
   const [vocalPresetId, setVocalPresetId] = useState<VocalPresetId>('none');
   const vocalPresetIdRef = useRef<VocalPresetId>('none');
   vocalPresetIdRef.current = vocalPresetId;
+
+  // Phase 8.10 — live input level polled at ~30Hz so the recorder
+  // panel itself can show a meter + scrolling waveform without forcing
+  // the user to look at the Audio Routing panel. Mirrors the polling
+  // loop in AudioRoutingContext but stays in plugin-host land
+  // (no direct context dependency — the recorder is plugin-scoped).
+  const [meterLevelDb, setMeterLevelDb] = useState(-120);
+  const [meterActive, setMeterActive] = useState(false);
+  const [meterClipped, setMeterClipped] = useState(false);
+  // Ref mirror of meterLevelDb so the scrolling waveform can pull
+  // the freshest value per RAF without re-rendering on each tick.
+  const meterLevelDbRef = useRef(-120);
+  meterLevelDbRef.current = meterLevelDb;
 
   // Refresh target info when scene changes; gates Record button.
   useEffect(() => {
@@ -93,6 +111,48 @@ export const RecorderPanel: React.FC<PluginUIProps> = ({
     return () => {
       cancelled = true;
     };
+  }, [host]);
+
+  // Phase 8.10 — poll the engine input level at ~30Hz to drive the
+  // panel-local meter + scrolling waveform. We can't share the
+  // AudioRoutingContext loop from a plugin (plugin-scoped, no
+  // renderer-context dependency), so the recorder polls separately.
+  // The cost is one extra IPC call per ~33ms — cheap.
+  useEffect(() => {
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const tick = async (): Promise<void> => {
+      if (stopped) return;
+      try {
+        const level = await host.getRecordingInputLevel();
+        if (!stopped) {
+          setMeterActive(level.active);
+          setMeterLevelDb(level.active ? level.peakDb : -120);
+          if (level.clipped) setMeterClipped(true);
+        }
+      } catch {
+        // Engine may not be up yet; just retry next tick.
+      }
+      if (!stopped) {
+        timer = setTimeout(tick, 33);
+      }
+    };
+    tick();
+
+    return () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [host]);
+
+  const handleClearClip = useCallback(async (): Promise<void> => {
+    try {
+      await host.clearRecordingInputClipIndicator();
+      setMeterClipped(false);
+    } catch (err) {
+      console.warn('[RecorderPanel] clearRecordingInputClipIndicator failed:', err);
+    }
   }, [host]);
 
   /**
@@ -165,6 +225,25 @@ export const RecorderPanel: React.FC<PluginUIProps> = ({
 
       if (newTakes.length > 0) {
         setTakes((prev) => [...prev, ...newTakes]);
+
+        // Phase 8.10 — kick off peak analysis for each new take so the
+        // row can render a peak/clip badge. Best-effort: rows render
+        // without the badge until the analysis resolves. Done per-take
+        // to surface results progressively rather than all-at-once.
+        for (const take of newTakes) {
+          analyzeWavPeak(host, take.filePath)
+            .then((peak) => {
+              setTakes((prev) =>
+                prev.map((t) => (t.trackId === take.trackId ? { ...t, peak } : t))
+              );
+            })
+            .catch((err) => {
+              console.warn(
+                `[RecorderPanel] peak analysis failed for ${take.label}:`,
+                err
+              );
+            });
+        }
       }
     },
     [host, takes.length]
@@ -277,6 +356,35 @@ export const RecorderPanel: React.FC<PluginUIProps> = ({
         </div>
       )}
 
+      {/* Phase 8.10 — live level meter (always visible while panel is
+          mounted, animates whenever the engine has the device open). */}
+      {!noPlatformInput && (
+        <LevelMeter
+          peakDb={meterLevelDb}
+          active={meterActive}
+          clipped={meterClipped}
+          onClearClip={handleClearClip}
+          data-testid="recorder-live-meter"
+        />
+      )}
+
+      {/* Phase 8.10 — scrolling waveform during recording. The wave
+          freezes when not recording so the user can see the last
+          take's tail without it scrolling away. */}
+      {(isRecording || meterActive) && (
+        <div
+          className="w-full h-12 rounded border border-sas-border bg-black/40"
+          data-testid="recorder-scrolling-waveform-wrap"
+        >
+          <ScrollingWaveform
+            getPeakDb={() => meterLevelDbRef.current}
+            active={isRecording}
+            className="w-full h-full"
+            fillStyle={isRecording ? '#dc3545' : '#6af2c5'}
+          />
+        </div>
+      )}
+
       {/* Vocal preset chooser */}
       <div className="flex items-center gap-2">
         <label className="text-[10px] text-sas-muted/60" htmlFor="recorder-vocal-preset">
@@ -316,6 +424,27 @@ export const RecorderPanel: React.FC<PluginUIProps> = ({
                   className="w-full h-8"
                 />
               </div>
+              {/* Phase 8.10 — per-take peak / clip badge. Renders once
+                  analysis resolves (asynchronous, post-take landing). */}
+              {take.peak && (
+                <span
+                  data-testid="recorder-take-peak"
+                  className={`shrink-0 px-1 py-0.5 rounded text-[9px] font-semibold tabular-nums ${
+                    take.peak.clipped
+                      ? 'bg-sas-danger text-white'
+                      : take.peak.peakDb > -3
+                        ? 'bg-yellow-500/30 text-yellow-300'
+                        : 'bg-sas-panel text-sas-muted'
+                  }`}
+                  title={
+                    take.peak.clipped
+                      ? `CLIPPED — peak ${take.peak.peakDb.toFixed(1)} dBFS`
+                      : `Peak ${take.peak.peakDb.toFixed(1)} dBFS`
+                  }
+                >
+                  {take.peak.clipped ? 'CLIP' : `${take.peak.peakDb.toFixed(0)}dB`}
+                </span>
+              )}
               <button
                 data-testid="recorder-take-delete"
                 onClick={() => handleDeleteTake(take.trackId)}
