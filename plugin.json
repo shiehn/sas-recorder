@@ -6,7 +6,7 @@
   "generatorType": "audio",
   "main": "index.js",
   "author": "Signals & Sorcery",
-  "minHostVersion": "2.1.0",
+  "minHostVersion": "2.3.0",
   "builtIn": true,
   "capabilities": {
     "audioCapture": true

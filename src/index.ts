@@ -28,7 +28,7 @@ export class RecorderPlugin implements GeneratorPlugin {
   readonly version = '1.0.0';
   readonly description = 'Loop-aware microphone recording — each loop creates a muted take';
   readonly generatorType = 'audio' as const;
-  readonly minHostVersion = '2.1.0';
+  readonly minHostVersion = '2.3.0';
 
   private host: PluginHost | null = null;
 
